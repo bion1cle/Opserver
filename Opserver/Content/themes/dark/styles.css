@@ -9752,6 +9752,9 @@ svg .stroke-muted.filled {
 a:focus {
   text-decoration: none;
 }
+.text-wrap {
+  white-space: normal;
+}
 h4,
 .h4,
 h5,
@@ -9796,6 +9799,9 @@ h6.page-header {
 }
 .page-header .pull-right {
   font-size: 0.9em;
+}
+.modal-header h4 .pull-right {
+  padding: 4px 10px 0 0;
 }
 .page-footer {
   position: absolute;

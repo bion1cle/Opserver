@@ -85,9 +85,12 @@ namespace StackExchange.Opserver.Data.SQL
 
         public LightweightCache<List<TableIndex>> GetIndexInfo(string databaseName) =>
             DatabaseFetch<TableIndex>(databaseName);
-        
+
         public LightweightCache<List<DatabaseDataSpace>> GetDataSpaceInfo(string databaseName) =>
             DatabaseFetch<DatabaseDataSpace>(databaseName);
+
+        public LightweightCache<List<DatabasePartition>> GetPartitionInfo(string databaseName) =>
+            DatabaseFetch<DatabasePartition>(databaseName);
 
         public Database GetDatabase(string databaseName) => Databases.Data?.FirstOrDefault(db => db.Name == databaseName);
 
@@ -386,9 +389,10 @@ Select db.database_id DatabaseId,
   Order By EstimatedImprovement Desc";
             }
         }
-        
+
         public class TableIndex : ISQLVersioned
         {
+            public string SchemaName { get; internal set; }
             public string TableName { get; internal set; }
             public string IndexName { get; internal set; }
             public DateTime? LastUpdated { get; internal set; }
@@ -402,10 +406,11 @@ Select db.database_id DatabaseId,
             public Version MinVersion => SQLServerVersions.SQL2008.SP1;
 
             public string GetFetchSQL(Version v) => @"
-  Select t.name TableName,
+ Select sc.name SchemaName,
+        t.name TableName,
 		i.name IndexName, 
         Stats_Date(s.object_id, s.stats_id) LastUpdated,   
-		i.type,
+		i.type Type,
         i.is_unique IsUnique,
         i.is_primary_key IsPrimaryKey,
 		i.is_disabled IsDisabled,
@@ -434,6 +439,8 @@ Select db.database_id DatabaseId,
   From sys.indexes i 
        Join sys.tables t
          On i.object_id = t.object_id 
+       Join sys.schemas sc
+         On t.schema_id = sc.schema_id
        Join sys.stats s 
          On i.object_id = s.object_id
         And i.index_id = s.stats_id
@@ -792,6 +799,7 @@ Drop Table #vlfTemp;";
             public DateTime LastModifiedDate { get; internal set; }
             public int IndexCount { get; internal set; }
             public long RowCount { get; internal set; }
+            public long PartitionCount { get; internal set; }
             public long DataTotalSpaceKB { get; internal set; }
             public long IndexTotalSpaceKB { get; internal set; }
             public long UsedSpaceKB { get; internal set; }
@@ -802,15 +810,16 @@ Drop Table #vlfTemp;";
             public string GetFetchSQL(Version v) => @"
 Select object_id, index_id, type Into #indexes From sys.indexes;
 Select object_id, index_id, partition_id Into #parts From sys.partitions;
-Select object_id, index_id, row_count Into #partStats From sys.dm_db_partition_stats;
+Select object_id, index_id, row_count, partition_id Into #partStats From sys.dm_db_partition_stats;
 
 Select t.object_id Id,
        s.name SchemaName,
        t.name TableName,
        t.create_date CreationDate,
        t.modify_date LastModifiedDate,
-       Count(i.index_id) IndexCount,
+       Count(Distinct i.index_id) IndexCount,
        Max(ddps.row_count) [RowCount],
+       Count(Distinct (Case When i.type In (0, 1, 5) Then p.partition_id Else Null End)) PartitionCount,
        Sum(Case When i.type In (0, 1, 5) Then a.total_pages Else 0 End) * 8 DataTotalSpaceKB,
        Sum(Case When i.type Not In (0, 1, 5) Then a.total_pages Else 0 End) * 8 IndexTotalSpaceKB,
        Sum(a.used_pages) * 8 UsedSpaceKB,
@@ -833,7 +842,8 @@ Select t.object_id Id,
        Left Join #partStats ddps
          On i.object_id = ddps.object_id
          And i.index_id = ddps.index_id
-         And i.type In (0, 1, 5) -- Heap, Clustered, Clustered Columnstore        
+         And i.type In (0, 1, 5) -- Heap, Clustered, Clustered Columnstore      
+         And p.partition_id = ddps.partition_id  
  Where t.is_ms_shipped = 0
    And i.object_id > 255
 Group By t.object_id, t.Name, t.create_date, t.modify_date, s.name;
@@ -1022,6 +1032,94 @@ Order By 1, 2, 3";
 
                 return string.Format(FetchSQL, "");
             }
+        }
+
+        public class DatabasePartition : ISQLVersioned
+        {
+            public Version MinVersion => SQLServerVersions.SQL2005.RTM;
+
+            public string SchemaName { get; internal set; }
+            public string TableName { get; internal set; }
+            public string IndexName { get; internal set; }
+            public int PartitionNumber { get; internal set; }
+            public string Filegroup { get; internal set; }
+            public string Scheme { get; internal set; }
+            public string Function { get; internal set; }
+            public string FunctionType { get; internal set; }
+            public int Fanout { get; internal set; }
+            public bool IsRight { get; internal set; }
+            public object RangeValue { get; internal set; }
+            public PartitionDataCompression DataCompression { get; internal set; }
+            public long RowCount { get; internal set; }
+            public long ReservedSpaceKB { get; internal set; }
+            public int IndexCount { get; internal set; }
+
+            public string RangeValueString
+            {
+                // TODO: C# 7 switch goodness
+                get
+                {
+                    if (RangeValue == null) return string.Empty;
+                    if (RangeValue is DateTime)
+                    {
+                        var date = (DateTime)RangeValue;
+                        return date.ToString(date.TimeOfDay.Ticks == 0 ? "yyyy-MM-dd" : "u");
+                    }
+                    return RangeValue.ToString();
+                }
+            }
+
+            public string GetFetchSQL(Version v) => @"
+  Select s.name SchemaName,
+         t.name TableName,
+         i.name IndexName,
+         p.partition_number PartitionNumber,
+         ds.name [Filegroup],
+         ps.name Scheme,
+         pf.name [Function],
+         pf.type_desc FunctionType,
+         pf.fanout Fanout,
+         pf.boundary_value_on_right IsRight,
+         prv.value RangeValue,
+         p.data_compression DataCompression,
+         Sum(Case When i.index_id In (1, 0) Then p.rows Else 0 End) [RowCount],
+         Sum(dbps.reserved_page_count) * 8 ReservedSpaceKB,
+         Sum(Case IsNull(i.index_id, 0) When 0 Then 0 Else 1 End) IndexCount
+    From sys.destination_data_spaces dds
+         Join sys.data_spaces ds 
+           On dds.data_space_id = ds.data_space_id
+         Join sys.partition_schemes ps 
+           On dds.partition_scheme_id = ps.data_space_id
+         Join sys.partition_functions pf 
+           On ps.function_id = pf.function_id
+         Left Join sys.partition_range_values prv 
+           On pf.function_id = prv.function_id
+           And dds.destination_id = (Case pf.boundary_value_on_right When 0 Then prv.boundary_id Else prv.boundary_id + 1 End)
+         Left Join sys.indexes i 
+           On dds.partition_scheme_id = i.data_space_id
+         Left Join sys.tables t
+           On i.object_id = t.object_id
+         Left Join sys.schemas s
+           On t.schema_id = s.schema_id
+         Left Join sys.partitions p 
+           On i.object_id = p.object_id
+           And i.index_id = p.index_id
+           And dds.destination_id = p.partition_number
+         Left Join sys.dm_db_partition_stats dbps 
+           On p.object_id = dbps.object_id
+           And p.partition_id = dbps.partition_id
+Group By t.name,
+         s.name,
+         i.name,
+         p.partition_number,
+         ds.name,
+         ps.name,
+         pf.name,
+         pf.type_desc,
+         pf.fanout,
+         pf.boundary_value_on_right,
+         prv.value,
+         p.data_compression";
         }
     }
 }
